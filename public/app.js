@@ -150,13 +150,16 @@
       const { wb, preserved } = await openWorkbook();
       const ws = wb.getWorksheet(state.sheet.slice(0, 31));
       if (!ws) throw new Error("평가표 시트를 찾지 못했습니다.");
-      addInputArea(ws, res);
+      const layout = addInputArea(ws, res);
+      const resultCreated = addResultSheet(wb, ws, res, layout);
       // 파일을 열면 평가표 시트가 보이게
       wb.worksheets.forEach((w) => { if (w.views && w.views[0]) w.views[0].tabSelected = w === ws; });
       wb.views = [{ activeTab: wb.worksheets.indexOf(ws), firstSheet: 0, visibility: "visible" }];
       const buf = await wb.xlsx.writeBuffer();
-      const base = state.fileName.replace(/\.[^.]+$/, "");
+      const base = state.fileName.replace(/\.[^.]+$/, "").replace(/_보완목록$/, "");
       download(buf, `${base}_보완목록.xlsx`);
+      if (layout.existing && !resultCreated) alert("이 파일에는 이미 작성란과 ‘보완결과’ 시트가 있어 바꾼 내용이 없습니다.");
+      else if (layout.existing) alert("이미 있던 작성란(입력한 내용 포함)은 그대로 두고 ‘보완결과’ 시트를 추가했습니다.");
       if (!preserved) alert("원본 형식(.xls/.csv)은 그대로 수정할 수 없어, 값만 옮긴 새 .xlsx 파일로 만들었습니다.");
     } catch (ex) {
       console.error(ex);
@@ -168,23 +171,44 @@
 
   // 원본 평가표 시트의 표 오른쪽(마지막 사용 열 다음)에 보완 작성란을 붙인다
   const INPUT_COLS = [
-    { key: "judge", title: "유효성 검토\n(판정)", width: 11, kind: "input" },
-    { key: "issue", title: "보완 필요 사항\n(검토 의견)", width: 30, kind: "input" },
+    { key: "judge", title: "유효성 검토", width: 11, kind: "input" },
+    { key: "issue", title: "보완 필요 사항", width: 30, kind: "input" },
     { key: "measure", title: "보완 대책", width: 30, kind: "input" },
-    { key: "af", title: "보완후\n빈도", width: 6, kind: "input" },
-    { key: "as", title: "보완후\n강도", width: 6, kind: "input" },
-    { key: "ar", title: "보완후\n위험도", width: 7, kind: "auto" },
+    { key: "af", title: "보완후 빈도", width: 9, kind: "input" },
+    { key: "as", title: "보완후 강도", width: 9, kind: "input" },
+    { key: "ar", title: "보완후 위험도", width: 10, kind: "auto" },
     { key: "owner", title: "담당자", width: 9, kind: "input" },
-    { key: "due", title: "완료\n예정일", width: 11, kind: "input" },
-    { key: "done", title: "완료\n확인", width: 7, kind: "input" },
+    { key: "due", title: "완료 예정일", width: 11, kind: "input" },
+    { key: "done", title: "완료 확인", width: 9, kind: "input" },
     { key: "memo", title: "비고", width: 14, kind: "input" },
   ];
+  // 작성란 뒤에 숨겨 두는 보조 열 (보완결과 시트가 참조)
+  const HELPER_COLS = ["보완순번", "작업내용(보조)", "평가구분(보조)"];
+
+  // 이미 작성란이 있는 파일(다시 올린 경우)인지 확인
+  function findExistingArea(ws, res) {
+    const hr = res.headerRow, last = Math.max(ws.columnCount || 0, 1);
+    for (let r = hr; r < res.dataStartRow; r++)
+      for (let c = 1; c <= last; c++) {
+        const v = ws.getCell(r, c).value;
+        if (typeof v === "string" && v.replace(/\s+/g, "").startsWith("유효성검토")) return c;
+      }
+    return 0;
+  }
 
   function addInputArea(ws, res) {
     const s = res.settings;
     const items = res.items;
     const hr = res.headerRow;
     const r1 = items[0].rowNum, r2 = items[items.length - 1].rowNum;
+
+    const existing = findExistingArea(ws, res);
+    if (existing) {
+      const ci = Object.fromEntries(INPUT_COLS.map((c, i) => [c.key, existing + i]));
+      const layout = { existing: true, ci, r1, r2, c0: existing, cEnd: existing + INPUT_COLS.length - 1 };
+      addHelperCols(ws, res, layout);
+      return layout;
+    }
 
     // 시작 열: 헤더~마지막 항목 행에서 값이 있는 가장 오른쪽 열의 다음 열
     const { rows } = sheetRows(state.sheet);
@@ -212,7 +236,8 @@
       cell.style = {};
       cell.font = font({ bold: true, color: { argb: "FFFFFFFF" } });
       cell.fill = solid(argb);
-      cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
+      // 원본 머리글 행이 낮아도 잘리지 않게 한 줄 + 칸에 맞춰 축소
+      cell.alignment = { horizontal: "center", vertical: "middle", shrinkToFit: true };
       cell.border = border;
     };
     let subRow = hr;
@@ -294,7 +319,166 @@
     if (pa && /:\$?[A-Z]+\$?\d+$/.test(pa)) {
       ws.pageSetup.printArea = pa.replace(/:(\$?)([A-Z]+)(\$?\d+)$/, (m, d, col, rest) => `:${d}${colLetter(cEnd)}${rest}`);
     }
-    state.inputArea = { from: colLetter(c0), to: colLetter(cEnd) };
+    const layout = { existing: false, ci, r1, r2, c0, cEnd };
+    addHelperCols(ws, res, layout);
+    return layout;
+  }
+
+  // 숨김 보조 열: 보완필요/보완완료 항목 순번, 병합 셀을 채운 작업내용·평가구분
+  function addHelperCols(ws, res, layout) {
+    const { ci, r1, r2, cEnd } = layout;
+    const h0 = cEnd + 1;
+    layout.helper = { seq: h0, proc: h0 + 1, div: h0 + 2 };
+    const already = ws.getCell(res.dataStartRow - 1, h0).value === HELPER_COLS[0];
+    HELPER_COLS.forEach((t, i) => {
+      ws.getCell(res.dataStartRow - 1, h0 + i).value = t;
+      ws.getColumn(h0 + i).hidden = true;
+    });
+    if (already) return;
+    const J = colLetter(ci.judge);
+    for (const it of res.items) {
+      const r = it.rowNum;
+      ws.getCell(r, h0).value = { formula: `IF(OR($${J}${r}="보완필요",$${J}${r}="보완완료"),COUNTIF($${J}$${r1}:$${J}${r},"보완필요")+COUNTIF($${J}$${r1}:$${J}${r},"보완완료"),"")` };
+      ws.getCell(r, h0 + 1).value = it.process || null;
+      ws.getCell(r, h0 + 2).value = it.division || null;
+    }
+    void r2;
+  }
+
+  // '보완결과' 시트: 평가표에서 보완필요(또는 보완완료)로 고른 항목이 자동으로 올라오고, 조치 결과를 입력
+  function addResultSheet(wb, ws, res, layout) {
+    if (wb.getWorksheet("보완결과")) return false;
+    const rs = wb.addWorksheet("보완결과", { views: [{ state: "frozen", ySplit: 5 }] });
+    const q = "'" + ws.name.replace(/'/g, "''") + "'!";
+    const colRef = (c) => `${q}$${colLetter(c)}:$${colLetter(c)}`;
+    const { ci, r1, r2, helper } = layout;
+    const seqRange = `${q}$${colLetter(helper.seq)}$${r1}:$${colLetter(helper.seq)}$${r2}`;
+    const src = (k) => (res.columns[k] ? res.columns[k].col + 1 : 0);
+    const n = res.items.length;
+    const s = res.settings;
+
+    const cols = [
+      { key: "no", title: "No", width: 5, kind: "pull" },
+      { key: "row", title: "원본 행", width: 7, kind: "pull" },
+      { key: "proc", title: "작업내용", width: 14, kind: "pull", from: helper.proc, text: true },
+      { key: "div", title: "평가구분", width: 8, kind: "pull", from: helper.div, text: true },
+      { key: "hazard", title: "위험요인 및 재해형태", width: 36, kind: "pull", from: src("hazard"), text: true },
+      { key: "risk", title: "현재 위험도", width: 8, kind: "pull", from: src("risk") },
+      { key: "judge", title: "판정", width: 9, kind: "pull", from: ci.judge, text: true },
+      { key: "issue", title: "보완 필요 사항", width: 26, kind: "pull", from: ci.issue, text: true },
+      { key: "measure", title: "보완 대책", width: 26, kind: "pull", from: ci.measure, text: true },
+      { key: "owner", title: "담당자", width: 9, kind: "pull", from: ci.owner, text: true },
+      { key: "due", title: "완료 예정일", width: 11, kind: "pull", from: ci.due, date: true },
+      { key: "result", title: "조치 결과 (실시 내용)", width: 34, kind: "input" },
+      { key: "rdate", title: "조치 일자", width: 11, kind: "input" },
+      { key: "rf", title: "조치후 빈도", width: 9, kind: "input" },
+      { key: "rsv", title: "조치후 강도", width: 9, kind: "input" },
+      { key: "rr", title: "조치후 위험도", width: 10, kind: "auto" },
+      { key: "checker", title: "확인자", width: 9, kind: "input" },
+      { key: "complete", title: "완료 여부", width: 9, kind: "input" },
+      { key: "memo", title: "비고", width: 14, kind: "input" },
+    ].filter((c) => c.kind !== "pull" || c.key === "no" || c.key === "row" || c.from);
+    const k = Object.fromEntries(cols.map((c, i) => [c.key, i + 1]));
+    const last = cols.length;
+    cols.forEach((c, i) => { rs.getColumn(i + 1).width = c.width; });
+
+    // 제목·안내·진행 현황
+    rs.mergeCells(1, 1, 1, last);
+    Object.assign(rs.getCell(1, 1), { value: "위험성평가 보완결과" });
+    rs.getCell(1, 1).font = { bold: true, size: 16 };
+    rs.getCell(1, 1).alignment = { horizontal: "center", vertical: "middle" };
+    rs.getRow(1).height = 28;
+    rs.mergeCells(2, 1, 2, last);
+    rs.getCell(2, 1).value = `※ ‘${ws.name}’ 시트의 ‘유효성 검토’에서 보완필요(또는 보완완료)를 고르면 이 시트에 자동으로 나타납니다. 노란 칸에 조치 결과를 입력하세요. ` +
+      "판정을 먼저 정한 뒤 결과를 입력하는 것을 권장합니다 (나중에 위쪽 행을 보완필요로 바꾸면 목록 순서가 한 칸씩 밀립니다).";
+    rs.getCell(2, 1).font = { size: 9, color: { argb: "FF7F7F7F" } };
+    rs.getCell(2, 1).alignment = { wrapText: true, vertical: "middle" };
+    rs.getRow(2).height = 28;
+
+    const R1 = 6, R2 = 5 + n;
+    const L = (key) => colLetter(k[key]);
+    const rr = (key) => `${L(key)}${R1}:${L(key)}${R2}`;
+    rs.mergeCells(3, 1, 3, last);
+    const p = rs.getCell(3, 1);
+    p.value = { formula: `"보완 대상 "&COUNT(${rr("row")})&"건   ·   조치 완료 "&COUNTIF(${rr("complete")},"완료")&"건   ·   미완료 "&(COUNT(${rr("row")})-COUNTIF(${rr("complete")},"완료"))&"건"` };
+    p.font = { bold: true, size: 11, color: { argb: "FF7F3F00" } };
+    p.fill = solid("FFFFF2CC");
+    p.alignment = { horizontal: "center", vertical: "middle" };
+    rs.getRow(3).height = 22;
+
+    // 머리글
+    const firstInput = k.result;
+    const groups = [
+      { from: 1, to: firstInput - 1, title: "평가표에서 자동으로 가져옴", argb: C.copyHead },
+      { from: firstInput, to: last, title: "보완 결과 (직접 입력)", argb: C.inputHead },
+    ];
+    for (const g of groups) {
+      rs.mergeCells(4, g.from, 4, g.to);
+      const c = rs.getCell(4, g.from);
+      c.value = g.title; c.fill = solid(g.argb);
+      c.font = { bold: true, color: { argb: "FFFFFFFF" } };
+      c.alignment = { horizontal: "center", vertical: "middle" };
+      c.border = border;
+    }
+    cols.forEach((col, i) => {
+      const c = rs.getCell(5, i + 1);
+      c.value = col.title;
+      c.fill = solid(col.kind === "pull" ? C.copyHead : col.kind === "auto" ? C.autoHead : "FFE26B0A");
+      c.font = { bold: true, size: 10, color: { argb: "FFFFFFFF" } };
+      c.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
+      c.border = border;
+    });
+    rs.getRow(5).height = 30;
+
+    // 데이터 행 (평가 항목 수만큼 미리 수식을 넣어 둠)
+    const light = { style: "thin", color: { argb: "FFD0D0D0" } };
+    const lightBorder = { top: light, left: light, bottom: light, right: light };
+    const plus = s.method === "add" ? "+" : "*";
+    for (let i = 0; i < n; i++) {
+      const r = R1 + i;
+      const B = `$${L("row")}${r}`;
+      rs.getCell(r, k.row).value = { formula: `IFERROR(MATCH(${i + 1},${seqRange},0)+${r1 - 1},"")` };
+      rs.getCell(r, k.no).value = { formula: `IF(${B}="","",${i + 1})` };
+      for (const col of cols) {
+        if (col.kind !== "pull" || !col.from) continue;
+        const ref = `INDEX(${colRef(col.from)},${B})`;
+        rs.getCell(r, k[col.key]).value = { formula: col.text ? `IF(${B}="","",${ref}&"")` : `IF(${B}="","",IF(${ref}="","",${ref}))` };
+        if (col.date) rs.getCell(r, k[col.key]).numFmt = "yyyy-mm-dd";
+      }
+      rs.getCell(r, k.rr).value = { formula: `IF(AND(ISNUMBER(${L("rf")}${r}),ISNUMBER(${L("rsv")}${r})),${L("rf")}${r}${plus}${L("rsv")}${r},"")` };
+      rs.getCell(r, k.rdate).numFmt = "yyyy-mm-dd";
+      rs.getCell(r, k.rf).dataValidation = { type: "whole", operator: "between", allowBlank: true, formulae: [1, s.fScale], showErrorMessage: true, error: `1~${s.fScale} 사이 숫자를 입력하세요.` };
+      rs.getCell(r, k.rsv).dataValidation = { type: "whole", operator: "between", allowBlank: true, formulae: [1, s.sScale], showErrorMessage: true, error: `1~${s.sScale} 사이 숫자를 입력하세요.` };
+      rs.getCell(r, k.complete).dataValidation = { type: "list", allowBlank: true, formulae: ['"완료,진행중,미착수"'] };
+      cols.forEach((col, j) => {
+        const c = rs.getCell(r, j + 1);
+        c.border = lightBorder;
+        c.font = { size: 10 };
+        const left = ["hazard", "issue", "measure", "result", "memo", "proc"].includes(col.key);
+        c.alignment = { vertical: "middle", horizontal: left ? "left" : "center", wrapText: true };
+      });
+      rs.getRow(r).height = 30;
+    }
+
+    // 항목이 올라온 행만 색칠 (평가표에서 가져온 칸 = 회색, 입력 칸 = 노랑), 완료 여부 색
+    const has = `$${L("row")}${R1}<>""`;
+    let pri = 1;
+    const cf = (ref, formula, argb, extra = {}) => rs.addConditionalFormatting({ ref, rules: [{ type: "expression", formulae: [formula], priority: pri++,
+      style: { fill: { type: "pattern", pattern: "solid", fgColor: { argb }, bgColor: { argb } }, ...extra } }] });
+    cf(`${L("complete")}${R1}:${L("complete")}${R2}`, `$${L("complete")}${R1}="완료"`, "FFC6EFCE", { font: { color: { argb: "FF006100" }, bold: true } });
+    cf(`${L("judge")}${R1}:${L("judge")}${R2}`, `$${L("judge")}${R1}="보완필요"`, "FFFFC7CE", { font: { color: { argb: "FF9C0006" }, bold: true } });
+    cf(`${L("judge")}${R1}:${L("judge")}${R2}`, `$${L("judge")}${R1}="보완완료"`, "FFDDEBF7", { font: { color: { argb: "FF1F4E79" }, bold: true } });
+    cf(`A${R1}:${colLetter(firstInput - 1)}${R2}`, has, "FFF2F2F2");
+    cf(`${colLetter(firstInput)}${R1}:${colLetter(last)}${R2}`, has, C.input);
+
+    rs.pageSetup = { paperSize: 8, orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0,
+      margins: { left: 0.3, right: 0.3, top: 0.4, bottom: 0.4, header: 0.2, footer: 0.2 }, printTitlesRow: "4:5" };
+
+    // 평가표 시트 바로 뒤에 배치
+    const others = wb.worksheets.filter((w) => w !== rs);
+    const idx = others.indexOf(ws) + 1;
+    [...others.slice(0, idx), rs, ...others.slice(idx)].forEach((w, i) => { w.orderNo = i; });
+    return true;
   }
 
   function download(buf, filename) {
