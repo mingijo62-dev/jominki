@@ -170,3 +170,13 @@ td.issues .i { color: var(--info); }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 .foot { padding: 28px 0 40px; }
+
+/* 보완목록 화면 */
+.panel.ready { display: flex; flex-wrap: wrap; gap: 14px; align-items: center; justify-content: space-between; }
+.btn.big { padding: 12px 20px; font-size: 16px; }
+.legend { display: grid; gap: 8px; margin-top: 10px; font-size: 14px; }
+.legend > div { display: flex; gap: 8px; align-items: baseline; }
+.sw { flex: none; display: inline-block; width: 14px; height: 14px; border-radius: 3px; border: 1px solid var(--line); transform: translateY(2px); }
+.sw.copy { background: #f2f2f2; }
+.sw.input { background: #fff9e6; border-color: #c65911; }
+.sw.auto { background: #dbe5f5; border-color: #2f5597; }

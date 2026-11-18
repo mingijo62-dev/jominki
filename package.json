@@ -8,9 +8,6 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "dependencies": {
-    "@anthropic-ai/sdk": "^1.10.0"
-  },
   "type": "module",
   "devDependencies": {
     "exceljs": "^4.4.0",

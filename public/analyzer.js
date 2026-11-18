@@ -10,6 +10,7 @@
   // 컬럼 역할 정의 (우선순위 순)
   const ROLE_PATTERNS = [
     ["no", /^(no|번호|순번|연번|일련번호)$/],
+    ["division", /^(평가구분|위험구분|4m구분|4m|구분)$/],
     ["process", /(공정|단위작업|작업명|작업내용|세부작업|작업단계|작업공정|설비명|장소)/],
     ["hazard", /(유해위험요인|유해위험요인파악|위험요인|유해요인|위험내용|위험상황|잠재위험|유해위험)/],
     ["category", /(분류|재해형태|재해유형|위험분류|유형|원인)/],
@@ -233,7 +234,7 @@
 
     // 데이터 행 수집
     const items = [];
-    let lastProcess = "";
+    let lastProcess = "", lastDivision = "";
     for (let r = dataStart; r < rows.length; r++) {
       const row = rows[r] || [];
       const get = (k) => (cols[k] != null ? row[cols[k]] : undefined);
@@ -250,11 +251,18 @@
       // 반복 헤더 행 건너뛰기
       if (HEADER_HINT.test(norm(hazard)) && /(유해|위험요인)/.test(norm(hazard)) && f == null) continue;
       let process = text(get("process"));
+      const newProcess = !!process;
       if (process) lastProcess = process; else process = lastProcess;
+      // 평가구분(4M)은 병합 셀이 많으므로 위 값을 이어 받음 (작업내용이 바뀌면 초기화)
+      let division = text(get("division"));
+      if (division) lastDivision = division;
+      else if (newProcess) lastDivision = "";
+      else division = lastDivision;
       items.push({
         rowNum: r + 1, // 엑셀 행 번호
         no: text(get("no")),
         process,
+        division,
         category: text(get("category")),
         hazard,
         current: text(get("current")),
