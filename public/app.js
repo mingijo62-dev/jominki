@@ -65,9 +65,19 @@
 
   function sheetRows(name) {
     const ws = state.wb.Sheets[name];
-    if (!ws["!ref"]) return { ws, rows: [] };
-    const rg = XLSX.utils.decode_range(ws["!ref"]);
-    rg.s.r = 0; rg.s.c = 0; // A1부터 읽어 행·열 번호를 엑셀과 일치시킴
+    if (!ws || !ws["!ref"]) return { ws: ws || {}, rows: [] };
+    // 실제 값이 있는 칸 기준으로 범위를 다시 계산 (서식만 시트 전체에 걸린 파일 대비)
+    let maxR = 0, maxC = 0;
+    for (const k of Object.keys(ws)) {
+      if (k[0] === "!") continue;
+      const cell = ws[k];
+      if (!cell || cell.v == null || cell.v === "") continue;
+      const a = XLSX.utils.decode_cell(k);
+      if (a.r > maxR) maxR = a.r;
+      if (a.c > maxC) maxC = a.c;
+    }
+    maxR = Math.min(maxR, 20000); maxC = Math.min(maxC, 200);
+    const rg = { s: { r: 0, c: 0 }, e: { r: maxR, c: maxC } }; // A1부터 읽어 행·열 번호를 엑셀과 일치시킴
     return { ws, rows: XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: "", blankrows: true, range: rg }) };
   }
 
@@ -80,9 +90,13 @@
       const opt = document.createElement("option");
       opt.value = opt.textContent = n;
       sel.appendChild(opt);
-      const { rows } = sheetRows(n);
-      const hr = RiskAnalyzer.findHeaderRow(rows);
-      const score = (hr >= 0 ? 100 : 0) + (/위험성|평가/.test(n) ? 10 : 0) + Math.min(rows.length, 50) / 10;
+      let score = 0;
+      try {
+        const { ws, rows } = sheetRows(n);
+        const r = RiskAnalyzer.analyze(rows, { merges: ws["!merges"] });
+        if (r.ok) score = 100 + Object.keys(r.columns).length * 10 + Math.min(r.items.length, 300) / 10;
+      } catch (ex) { console.warn(n, ex); }
+      if (/위험성|평가/.test(n)) score += 5;
       if (score > bestScore) { bestScore = score; best = n; }
     }
     sel.value = best;
@@ -100,9 +114,21 @@
 
   // ---------- 분석 ----------
   function runAnalysis() {
+    try {
+      runAnalysisInner();
+    } catch (ex) {
+      console.error(ex);
+      state.result = null;
+      $("report").hidden = true;
+      $("sheetError").innerHTML = `이 시트를 분석하는 중 오류가 발생했습니다. 위의 ‘시트’ 목록에서 위험성평가표가 있는 다른 시트를 골라 보세요.<br><span class="small">오류 내용: ${esc(ex && ex.message)}</span>`;
+      $("sheetError").hidden = false;
+    }
+  }
+  function runAnalysisInner() {
     state.sheet = $("sheetSel").value;
     const { ws, rows } = sheetRows(state.sheet);
-    const res = RiskAnalyzer.analyze(rows, { merges: ws["!merges"], ...state.opts });
+    const merges = (ws["!merges"] || []).filter((m) => m.s.r <= 20000);
+    const res = RiskAnalyzer.analyze(rows, { merges, ...state.opts });
     state.result = res;
     $("aiOut").hidden = true; $("aiOut").innerHTML = "";
     if (!res.ok) {
@@ -289,50 +315,100 @@
     for (const m of src["!merges"] || []) {
       try { ws.mergeCells(m.s.r + 1, m.s.c + 1, m.e.r + 1, m.e.c + 1); } catch {}
     }
-    const width = Math.max(0, ...rows.map((r) => r.length));
+    const width = rows.reduce((m, r) => Math.max(m, r.length), 0);
     for (let c = 1; c <= width; c++) ws.getColumn(c).width = 14;
     return { wb: wb2, ws, preserved: false };
   }
 
+  // 원본 오른쪽에 붙이는 '유효성 검토' 작성 영역
+  const REVIEW_COLS = [
+    { key: "status", title: "검토 판정", width: 11 },
+    { key: "comment", title: "검토 의견 (자동)", width: 48 },
+    { key: "fix", title: "보완 내용 (작성)", width: 40, input: true },
+    { key: "f", title: "보완후\n빈도", width: 7, input: true },
+    { key: "s", title: "보완후\n강도", width: 7, input: true },
+    { key: "r", title: "보완후\n위험도", width: 8 },
+    { key: "owner", title: "보완\n담당자", width: 10, input: true },
+    { key: "due", title: "완료\n예정일", width: 12, input: true },
+    { key: "done", title: "완료\n확인", width: 9, input: true },
+  ];
+  const STATUS_LIST = '"적정,보완필요,보완완료,해당없음"';
+  const colLetter = (n) => { let s = ""; while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); } return s; };
+
   function markSheet(ws, res) {
+    state.reviewRange = null;
     const byRow = new Map();
     for (const f of res.findings) if (f.row) { if (!byRow.has(f.row)) byRow.set(f.row, []); byRow.get(f.row).push(f); }
 
-    // 검토결과 열 위치: 기존 사용 열의 바로 오른쪽
     const { rows } = sheetRows(state.sheet);
-    const lastCol = Math.max(ws.columnCount || 0, ...rows.map((r) => r.length));
-    const outCol = lastCol + 1;
-    ws.getColumn(outCol).width = 60;
+    const lastCol = Math.max(ws.columnCount || 0, rows.reduce((m, r) => Math.max(m, r.length), 0));
+    const c0 = lastCol + 1; // 작성 영역 시작 열
+    const col = Object.fromEntries(REVIEW_COLS.map((c, i) => [c.key, c0 + i]));
+    REVIEW_COLS.forEach((c, i) => { ws.getColumn(c0 + i).width = c.width; });
 
-    // 헤더
+    // 원본 글자 크기에 맞춤
+    const first = res.items[0];
+    const baseSize = (first && res.columns.hazard && ws.getCell(first.rowNum, res.columns.hazard.col + 1).font?.size) || 10;
+    const border = { top: thin, left: thin, bottom: thin, right: thin };
+
+    // 머리글: 2단 헤더면 위에 묶음 제목, 아래에 항목명
     const hr = res.headerRow;
-    const head = own(ws.getCell(hr, outCol));
-    head.value = "검토결과 (자동)";
-    head.font = { bold: true, color: { argb: "FFFFFFFF" } };
-    head.fill = solid("FFC00000");
-    head.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
-    head.border = { top: thin, left: thin, bottom: thin, right: thin };
-    if (res.dataStartRow > hr + 1) {
-      try { ws.mergeCells(hr, outCol, res.dataStartRow - 1, outCol); } catch {}
+    const headRows = Math.max(1, res.dataStartRow - hr);
+    const styleHead = (cell, argb) => {
+      own(cell);
+      cell.font = { bold: true, size: baseSize, color: { argb: "FFFFFFFF" } };
+      cell.fill = solid(argb);
+      cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
+      cell.border = border;
+    };
+    let subRow = hr;
+    if (headRows >= 2) {
+      const g = ws.getCell(hr, c0);
+      g.value = "유효성 검토 (재검토 결과 및 보완 작성란)";
+      try { ws.mergeCells(hr, c0, hr, c0 + REVIEW_COLS.length - 1); } catch {}
+      styleHead(g, "FF1F4E79");
+      subRow = hr + 1;
     }
+    REVIEW_COLS.forEach((c, i) => {
+      const cell = ws.getCell(subRow, c0 + i);
+      cell.value = c.title;
+      styleHead(cell, c.input ? "FFC65911" : "FF2F5597");
+      if (res.dataStartRow - 1 > subRow) { try { ws.mergeCells(subRow, c0 + i, res.dataStartRow - 1, c0 + i); } catch {} }
+    });
 
-    // 항목별 결과
+    // 항목별
+    const plus = res.settings.method === "add" ? "+" : "*";
     for (const it of res.items) {
-      const fs = byRow.get(it.rowNum) || [];
-      const cell = own(ws.getCell(it.rowNum, outCol));
-      cell.border = { top: thin, left: thin, bottom: thin, right: thin };
-      cell.alignment = { vertical: "top", wrapText: true };
-      if (!fs.length) {
-        cell.value = "이상 없음";
-        cell.font = { color: { argb: "FF006100" } };
-        continue;
-      }
+      const r = it.rowNum;
+      const fs = byRow.get(r) || [];
+      const needs = fs.some((f) => f.level === "error" || f.level === "warn");
       const worst = fs.reduce((a, f) => (RANK[f.level] > RANK[a] ? f.level : a), "info");
-      cell.value = fs.map((f) => `[${LEVEL_KO[f.level]}] ${f.msg}`).join("\n");
-      cell.font = { color: { argb: FONT[worst] } };
-      cell.fill = solid(FILL[worst]);
 
-      // 문제 칸에 색칠 + 메모
+      REVIEW_COLS.forEach((c, i) => {
+        const cell = own(ws.getCell(r, c0 + i));
+        cell.border = border;
+        cell.font = { size: baseSize };
+        cell.alignment = { vertical: "middle", horizontal: c.key === "comment" || c.key === "fix" ? "left" : "center", wrapText: true };
+        if (c.input) cell.fill = solid("FFFFFBEA");
+      });
+
+      const st = ws.getCell(r, col.status);
+      st.value = needs ? "보완필요" : "적정";
+      st.dataValidation = { type: "list", allowBlank: true, formulae: [STATUS_LIST], showErrorMessage: true, errorTitle: "검토 판정", error: "목록에서 선택하세요." };
+      st.font = { size: baseSize, bold: true };
+
+      const cm = ws.getCell(r, col.comment);
+      cm.value = fs.length ? fs.map((f) => `[${LEVEL_KO[f.level]}] ${f.msg}`).join("\n") : "이상 없음";
+      cm.font = { size: baseSize, color: { argb: fs.length ? FONT[worst] : "FF006100" } };
+      cm.note = cm.value; // 행 높이가 낮아도 마우스를 올리면 전체 내용 확인
+
+      const fL = colLetter(col.f), sL = colLetter(col.s);
+      ws.getCell(r, col.r).value = { formula: `IF(AND(ISNUMBER(${fL}${r}),ISNUMBER(${sL}${r})),${fL}${r}${plus}${sL}${r},"")` };
+      for (const k of ["f", "s"]) ws.getCell(r, col[k]).dataValidation = { type: "whole", operator: "between", allowBlank: true, formulae: [1, k === "f" ? res.settings.fScale : res.settings.sScale], showErrorMessage: true, error: "척도 범위의 숫자를 입력하세요." };
+      ws.getCell(r, col.due).numFmt = "yyyy-mm-dd";
+      ws.getCell(r, col.done).dataValidation = { type: "list", allowBlank: true, formulae: ['"완료,진행중,미착수"'] };
+
+      // 원본의 문제 칸에 색칠 + 메모
       const byField = new Map();
       for (const f of fs) {
         if (!f.field || !res.columns[f.field]) continue;
@@ -340,13 +416,27 @@
         byField.get(f.field).push(f);
       }
       for (const [field, list] of byField) {
-        const target = own(ws.getCell(it.rowNum, res.columns[field].col + 1));
+        const target = own(ws.getCell(r, res.columns[field].col + 1));
         const lv = list.reduce((a, f) => (RANK[f.level] > RANK[a] ? f.level : a), "info");
         target.fill = solid(FILL[lv]);
         const msg = "[검토] " + list.map((f) => `${LEVEL_KO[f.level]}: ${f.msg}`).join("\n");
         const prev = target.note ? (typeof target.note === "string" ? target.note : (target.note.texts || []).map((t) => t.text).join("")) : "";
         target.note = prev ? `${prev}\n\n${msg}` : msg;
       }
+    }
+
+    // 판정 칸 색: 사용자가 바꾸면 자동으로 색이 바뀌도록 조건부 서식
+    if (res.items.length) {
+      const r1 = res.items[0].rowNum, r2 = res.items[res.items.length - 1].rowNum;
+      const L = colLetter(col.status);
+      let pri = 1;
+      const rule = (text, argb, fontArgb) => ({ type: "expression", formulae: ["$" + L + r1 + '="' + text + '"'], priority: pri++,
+        style: { fill: { type: "pattern", pattern: "solid", fgColor: { argb }, bgColor: { argb } }, font: { color: { argb: fontArgb }, bold: true } } });
+      ws.addConditionalFormatting({ ref: `${L}${r1}:${L}${r2}`, rules: [
+        rule("보완필요", "FFFFC7CE", "FF9C0006"), rule("보완완료", "FFDDEBF7", "FF1F4E79"),
+        rule("적정", "FFC6EFCE", "FF006100"), rule("해당없음", "FFEDEDED", "FF595959"),
+      ] });
+      state.reviewRange = { sheet: ws.name, r1, r2, status: L, fix: colLetter(col.fix), done: colLetter(col.done) };
     }
   }
 
@@ -363,7 +453,7 @@
     s.getCell(1, 1).font = { bold: true, size: 16 };
     let r = 3;
     put(r++, "파일", state.fileName);
-    put(r++, "검토 시트", `${state.sheet} (이 시트의 오른쪽 끝에 ‘검토결과’ 열이 추가됨)`);
+    put(r++, "검토 시트", `${state.sheet} (오른쪽 끝에 ‘유효성 검토’ 작성란이 추가됨 — 노란 칸에 직접 작성)`);
     put(r++, "검토일", new Date().toISOString().slice(0, 10));
     put(r++, "점수 / 판정", `${res.score}점 / ${res.verdict}`);
     put(r++, "지적 건수", `오류 ${res.counts.error} · 경고 ${res.counts.warn} · 참고 ${res.counts.info}`);
@@ -372,6 +462,22 @@
     put(r++, "", "노랑 = 경고", { fill: FILL.warn });
     put(r++, "", "파랑 = 참고  (색칠된 칸에 마우스를 올리면 메모로 이유가 보입니다)", { fill: FILL.info });
     if (!preserved) put(r++, "안내", "원본 형식(.xls/.csv 등)을 직접 수정할 수 없어 값만 옮긴 새 파일로 만들었습니다.");
+    const rr = state.reviewRange;
+    if (rr) {
+      r++;
+      s.getCell(r++, 1).value = "유효성 검토 진행 현황 (작성하면 자동 갱신)";
+      s.getCell(r - 1, 1).font = { bold: true, size: 13 };
+      const q = `'${rr.sheet.replace(/'/g, "''")}'!`;
+      const rng = (L) => `${q}${L}${rr.r1}:${L}${rr.r2}`;
+      const f = (r_, label, formula) => { put(r_, label, ""); s.getCell(r_, 2).value = { formula }; s.getCell(r_, 2).alignment = { horizontal: "left" }; };
+      f(r++, "전체 항목", `COUNTA(${rng(rr.status)})`);
+      f(r++, "적정", `COUNTIF(${rng(rr.status)},"적정")`);
+      f(r++, "보완필요", `COUNTIF(${rng(rr.status)},"보완필요")`);
+      f(r++, "보완완료", `COUNTIF(${rng(rr.status)},"보완완료")`);
+      f(r++, "보완 내용 작성", `COUNTA(${rng(rr.fix)})`);
+      f(r++, "검토 완료율", `IFERROR(TEXT((COUNTIF(${rng(rr.status)},"적정")+COUNTIF(${rng(rr.status)},"보완완료")+COUNTIF(${rng(rr.status)},"해당없음"))/COUNTA(${rng(rr.status)}),"0%"),"-")`);
+      put(r++, "작성 방법", "① ‘검토 판정’에서 적정/보완필요/보완완료/해당없음 선택  ② 보완이 필요하면 ‘보완 내용’, 보완후 빈도·강도(위험도는 자동 계산), 담당자, 완료 예정일 작성  ③ 조치 후 ‘완료 확인’과 판정을 ‘보완완료’로 변경");
+    }
     r++;
     const general = res.findings.filter((f) => !f.row);
     if (general.length) {

@@ -11,8 +11,8 @@
   const ROLE_PATTERNS = [
     ["no", /^(no|번호|순번|연번|일련번호)$/],
     ["process", /(공정|단위작업|작업명|작업내용|세부작업|작업단계|작업공정|설비명|장소)/],
-    ["category", /(분류|재해형태|재해유형|위험분류|유형|원인)/],
     ["hazard", /(유해위험요인|유해위험요인파악|위험요인|유해요인|위험내용|위험상황|잠재위험|유해위험)/],
+    ["category", /(분류|재해형태|재해유형|위험분류|유형|원인)/],
     ["current", /(현재안전|현재의안전|현재조치|현안전|기존대책|현재대책|현재상태|현행)/],
     ["law", /(관련근거|법적기준|관련법규|법규)/],
     ["freq", /(가능성|빈도)/],
@@ -175,8 +175,8 @@
   }
   const fmtDate = (d) => (d ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}` : "");
 
-  const WEAK_MEASURE = /(주의|철저|준수|유의|숙지|당부|강조|경각심|조심|안전의식|생활화|습관화|확인할것|교육실시|교육강화|안전교육|tbm|주지)/;
-  const STRONG_MEASURE = /(설치|교체|제거|대체|방호|덮개|울|난간|가드|인터록|인터락|센서|자동|격리|차단|국소배기|환기|개선|보강|고정|개조|변경|잠금|loto|접지|누전|안전장치|비상정지|방책|칸막이|도입|구매|보수|수리|배치|정비|표지)/;
+  const WEAK_MEASURE = /(주의|철저|준수|유의|숙지|당부|강조|경각심|조심|안전의식|생활화|습관화|확인할것|교육|tbm|주지|위험예지|침착|지도|공유|인지)/;
+  const STRONG_MEASURE = /(설치|교체|제거|대체|방호|덮개|울|난간|가드|인터록|인터락|센서|자동|격리|차단|국소배기|환기|개선|보강|고정|개조|변경|잠금|loto|접지|누전|안전장치|비상정지|방책|칸막이|도입|구매|보수|수리|배치|정비|표지|홀더|지그|치공구|전용|출입문|점검구|차단|허가서|작업표찰)/;
   const PPE_ONLY = /(보호구|안전모|안전화|장갑|보안경|마스크|귀마개|안전대|방독|방진|착용)/;
 
   /**
@@ -203,7 +203,7 @@
     const preText = rows.slice(0, hr).map((r) => (r || []).map(text).join(" ")).join("\n");
     const meta = {};
     {
-      const m = preText.match(/(평가\s*일자?|평가\s*일시|실시\s*일자?|작성\s*일자?|평가\s*기간)[^\d]{0,10}((?:19|20)\d{2}[.\-/년\s]+\d{1,2}[.\-/월\s]+\d{1,2})/);
+      const m = preText.match(/(평가\s*일자?|평가\s*일시|실시\s*일자?|작성\s*일자?|평가\s*기간)[^\d]{0,30}((?:19|20)\d{2}[.\-/년\s]+\d{1,2}[.\-/월\s]+\d{1,2})/);
       let d = m ? toDate(m[2]) : null;
       if (!d) {
         // 헤더 위 영역 숫자 날짜 셀
@@ -212,8 +212,22 @@
         }
       }
       meta.evalDate = d ? fmtDate(d) : "";
-      meta.workerParticipation = /(근로자|작업자|현장)\s*(참여|의견|서명|대표)|참여자|참석자|청취/.test(allText);
-      meta.typeText = (preText.match(/(최초|정기|수시|상시)\s*(평가|위험성평가)?/) || [""])[0];
+      meta.workerParticipation = /(근로자|작업자|현장)\s*(참여|의견|서명|대표)|참여자|참석자|청취|반원|팀원|조원|평가자/.test(allText);
+      const checked = preText.match(/(최초|정기|수시|상시)\s*(평가)?\s*[■☑✔✓●▣]/);
+      meta.typeText = checked ? checked[1] : (preText.match(/(최초|정기|수시|상시)\s*(평가|위험성평가)?/) || [""])[0];
+      // 평균위험도 기재값 (예: 평균위험도 | 현재 3.47 | 개선후 3.46)
+      meta.avgStated = null;
+      outer: for (let r = 0; r < hr; r++) for (let c = 0; c < (rows[r] || []).length; c++) {
+        if (!/평균\s*위험/.test(text(rows[r][c]))) continue;
+        const nums = [];
+        for (let rr = r; rr <= Math.min(r + 2, hr - 1); rr++)
+          for (let cc = c; cc < Math.min(c + 8, (rows[rr] || []).length); cc++) {
+            const v = rows[rr][cc];
+            if (typeof v === "number" && v > 0 && v < 100) nums.push(v);
+          }
+        if (nums.length) meta.avgStated = { before: nums[0], after: nums.length > 1 ? nums[1] : null };
+        break outer;
+      }
       meta.methodText = (allText.match(/(빈도\s*[·x×*]\s*강도|3\s*[x×]\s*3|4\s*[x×]\s*4|5\s*[x×]\s*5|체크리스트|3단계\s*판단|핵심요인\s*기술|OPS|위험성\s*수준\s*3단계)/i) || [""])[0];
     }
 
@@ -267,8 +281,8 @@
     }
     if (!has("measure")) add("error", null, "COL_MEASURE", "‘감소대책(개선대책)’ 열을 찾지 못했습니다.");
     if (!has("after_risk") && !has("after_freq")) add("warn", null, "COL_AFTER", "‘개선 후 위험성’ 열이 없습니다. 감소대책의 효과(잔류 위험성)를 확인할 수 없습니다.");
-    if (!has("owner")) add("warn", null, "COL_OWNER", "‘담당자’ 열이 없습니다. 감소대책 이행 책임자를 지정해야 합니다.");
-    if (!has("due") && !has("done")) add("warn", null, "COL_DUE", "‘개선 예정일/완료일’ 열이 없습니다. 이행 일정을 관리할 수 없습니다.");
+    if (!has("owner")) add("info", null, "COL_OWNER", "양식에 ‘담당자’ 열이 없습니다. 감소대책 이행 책임자를 지정해야 합니다. (결과 파일의 작성란에 추가됨)");
+    if (!has("due") && !has("done")) add("info", null, "COL_DUE", "양식에 ‘개선 예정일/완료일’ 열이 없습니다. 이행 일정을 관리해야 합니다. (결과 파일의 작성란에 추가됨)");
 
     if (!meta.evalDate) add("info", null, "META_DATE", "평가 실시일자를 찾지 못했습니다. 평가일자를 기록해 두어야 정기평가 주기(매년)를 관리할 수 있습니다.");
     else {
@@ -354,6 +368,13 @@
         if (i.current && norm(i.current) === nm) iss("warn", "MEAS_SAME", "감소대책이 ‘현재 안전조치’와 동일합니다. 추가 대책 없이 위험성이 줄어든다고 볼 수 없습니다.", "measure");
       }
 
+      // 현재 안전조치가 교육·주의 위주인데 빈도를 최저로 평가
+      if (i.current && i.freq === 1 && WEAK_MEASURE.test(norm(i.current)) && !STRONG_MEASURE.test(norm(i.current)))
+        iss("warn", "CUR_WEAK_LOWFREQ", `현재 안전조치(“${i.current}”)가 교육·주의 위주인데 빈도를 최저(1)로 평가했습니다. 빈도가 과소평가되었을 수 있습니다.`, "freq");
+      else if (i.current && WEAK_MEASURE.test(norm(i.current)) && !STRONG_MEASURE.test(norm(i.current)) && !PPE_ONLY.test(norm(i.current)))
+        iss("info", "CUR_WEAK", `현재 안전조치(“${i.current}”)가 교육·주의 등 관리적 조치뿐입니다. 공학적 대책 추가를 검토하세요.`, "current");
+      if (!i.current && has("current")) iss("info", "CUR_EMPTY", "현재 안전조치가 비어 있습니다.", "current");
+
       // 개선 후
       const afterExpected = calc(i.afterFreq, i.afterSev);
       const afterNum = i.afterRisk != null ? i.afterRisk : afterExpected;
@@ -389,6 +410,30 @@
         if (dupKey.has(k)) iss("info", "DUP", `${dupKey.get(k)}행과 공정·유해위험요인이 중복됩니다.`, "hazard");
         else dupKey.set(k, R);
       }
+    }
+
+    // 개선(감소대책) 실시 여부 — 문서 전체
+    if (has("measure") && items.length >= 3) {
+      const noMeas = items.filter((i) => !i.measure).length;
+      const sameAfter = items.filter((i) => {
+        const b = i.risk != null ? i.risk : calc(i.freq, i.sev);
+        const a = i.afterRisk != null ? i.afterRisk : calc(i.afterFreq, i.afterSev);
+        return a != null && b != null && a === b;
+      }).length;
+      if (noMeas / items.length >= 0.8)
+        add("warn", null, "NO_IMPROVEMENT", `전체 ${items.length}개 항목 중 ${noMeas}개에 개선대책이 없습니다${sameAfter ? ` (개선 후 위험도가 개선 전과 같은 항목 ${sameAfter}개)` : ""}. 위험성 감소 활동(유효성 검토)이 실질적으로 이루어지지 않은 것으로 보입니다.`);
+    }
+    // 평균위험도 기재값 검증
+    if (meta.avgStated) {
+      const avg = (arr) => (arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null);
+      const before = avg(items.map((i) => (i.risk != null ? i.risk : calc(i.freq, i.sev))).filter((x) => x != null));
+      const after = avg(items.map((i) => (i.afterRisk != null ? i.afterRisk : calc(i.afterFreq, i.afterSev))).filter((x) => x != null));
+      const r2 = (x) => Math.round(x * 100) / 100;
+      meta.avgCalc = { before: before != null ? r2(before) : null, after: after != null ? r2(after) : null };
+      if (before != null && Math.abs(r2(before) - meta.avgStated.before) > 0.011)
+        add("warn", null, "AVG_BEFORE", `상단 ‘평균위험도(현재)’ 기재값 ${meta.avgStated.before}이(가) 실제 항목 평균 ${r2(before)}과(와) 다릅니다.`);
+      if (after != null && meta.avgStated.after != null && Math.abs(r2(after) - meta.avgStated.after) > 0.011)
+        add("warn", null, "AVG_AFTER", `상단 ‘평균위험도(개선후)’ 기재값 ${meta.avgStated.after}이(가) 실제 항목 평균 ${r2(after)}과(와) 다릅니다.`);
     }
 
     // 분포 점검 — 모든 항목이 저위험이면 과소평가 의심
