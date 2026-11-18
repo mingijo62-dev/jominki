@@ -50,6 +50,7 @@
           wb = XLSX.read(data, { type: "array", cellDates: true });
         }
         state.wb = wb;
+        state.fileBuf = e.target.result;
         state.fileName = file.name;
         state.opts = {};
         setupSheets();
@@ -64,7 +65,10 @@
 
   function sheetRows(name) {
     const ws = state.wb.Sheets[name];
-    return { ws, rows: XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: "", blankrows: true }) };
+    if (!ws["!ref"]) return { ws, rows: [] };
+    const rg = XLSX.utils.decode_range(ws["!ref"]);
+    rg.s.r = 0; rg.s.c = 0; // A1부터 읽어 행·열 번호를 엑셀과 일치시킴
+    return { ws, rows: XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: "", blankrows: true, range: rg }) };
   }
 
   function setupSheets() {
@@ -230,58 +234,169 @@
     $("itemsTable").innerHTML = head + `<tbody>${body}</tbody>`;
   }
 
-  // ---------- 엑셀 다운로드 ----------
-  $("dlBtn").addEventListener("click", () => {
+  // ---------- 엑셀 다운로드 (원본 파일에 직접 표시) ----------
+  const FILL = { error: "FFFFC7CE", warn: "FFFFEB9C", info: "FFDDEBF7" };
+  const FONT = { error: "FF9C0006", warn: "FF9C5700", info: "FF1F4E79" };
+  const RANK = { error: 3, warn: 2, info: 1 };
+  const solid = (argb) => ({ type: "pattern", pattern: "solid", fgColor: { argb } });
+  const thin = { style: "thin", color: { argb: "FFBFBFBF" } };
+  // ExcelJS는 같은 서식의 칸끼리 스타일 객체를 공유하므로, 칸마다 복사본을 만든 뒤 수정
+  const own = (cell) => { cell.style = JSON.parse(JSON.stringify(cell.style || {})); return cell; };
+
+  $("dlBtn").addEventListener("click", async () => {
     const res = state.result;
     if (!res || !res.ok) return;
+    const btn = $("dlBtn");
+    const label = btn.textContent;
+    btn.disabled = true; btn.textContent = "만드는 중…";
+    try {
+      const { wb, ws, preserved } = await openTargetWorkbook();
+      markSheet(ws, res);
+      addSummarySheets(wb, res, preserved);
+      const buf = await wb.xlsx.writeBuffer();
+      const base = state.fileName.replace(/\.[^.]+$/, "");
+      const url = URL.createObjectURL(new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
+      const a = document.createElement("a");
+      a.href = url; a.download = `${base}_검토결과.xlsx`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    } catch (ex) {
+      console.error(ex);
+      alert("결과 파일을 만들지 못했습니다: " + ex.message);
+    } finally {
+      btn.disabled = false; btn.textContent = label;
+    }
+  });
+
+  // .xlsx/.xlsm 은 원본 그대로 열고, .xls/.csv 는 값으로 새 통합문서를 만든다
+  async function openTargetWorkbook() {
+    const wb = new ExcelJS.Workbook();
+    if (/\.(xlsx|xlsm)$/i.test(state.fileName)) {
+      try {
+        await wb.xlsx.load(state.fileBuf.slice(0));
+        const ws = wb.getWorksheet(state.sheet);
+        if (ws) return { wb, ws, preserved: true };
+      } catch (ex) {
+        console.warn("원본 열기 실패, 값으로 대체", ex);
+      }
+    }
+    const wb2 = new ExcelJS.Workbook();
+    const ws = wb2.addWorksheet(state.sheet.slice(0, 31) || "Sheet1");
+    const { ws: src, rows } = sheetRows(state.sheet);
+    rows.forEach((r, i) => r.forEach((v, c) => {
+      if (v !== "" && v != null) ws.getCell(i + 1, c + 1).value = v instanceof Date ? v : v;
+    }));
+    for (const m of src["!merges"] || []) {
+      try { ws.mergeCells(m.s.r + 1, m.s.c + 1, m.e.r + 1, m.e.c + 1); } catch {}
+    }
+    const width = Math.max(0, ...rows.map((r) => r.length));
+    for (let c = 1; c <= width; c++) ws.getColumn(c).width = 14;
+    return { wb: wb2, ws, preserved: false };
+  }
+
+  function markSheet(ws, res) {
     const byRow = new Map();
     for (const f of res.findings) if (f.row) { if (!byRow.has(f.row)) byRow.set(f.row, []); byRow.get(f.row).push(f); }
 
-    const summary = [
-      ["위험성평가 재검토 결과"],
-      [],
-      ["파일", state.fileName], ["시트", state.sheet],
-      ["검토일", new Date().toISOString().slice(0, 10)],
-      ["점수", res.score], ["종합 판정", res.verdict],
-      ["오류", res.counts.error], ["경고", res.counts.warn], ["참고", res.counts.info],
-      ["평가 기준", `${res.settings.fScale}×${res.settings.sScale}, ${res.settings.method === "mul" ? "곱셈" : "덧셈"}, 허용 가능 ≤ ${res.settings.acceptable}`],
-      ["평가일자", res.meta.evalDate || "미확인"],
-      [],
-      ["※ 본 결과는 자동 검토 결과로 참고용입니다."],
-    ];
-    const findings = [["수준", "행", "코드", "내용"], ...res.findings.map((f) => [LEVEL_KO[f.level], f.row || "전체", f.code, f.msg])];
-
-    // 원본 시트 + 검토결과 열 추가
+    // 검토결과 열 위치: 기존 사용 열의 바로 오른쪽
     const { rows } = sheetRows(state.sheet);
-    const width = Math.max(...rows.map((r) => r.length));
-    const annotated = rows.map((r, i) => {
-      const out = r.slice();
-      while (out.length < width) out.push("");
-      if (i === res.headerRow - 1) out.push("검토결과");
-      else {
-        const fs = byRow.get(i + 1);
-        out.push(fs ? fs.map((f) => `[${LEVEL_KO[f.level]}] ${f.msg}`).join("\n") : "");
-      }
-      return out;
-    });
+    const lastCol = Math.max(ws.columnCount || 0, ...rows.map((r) => r.length));
+    const outCol = lastCol + 1;
+    ws.getColumn(outCol).width = 60;
 
-    const wb = XLSX.utils.book_new();
-    const ws1 = XLSX.utils.aoa_to_sheet(summary); ws1["!cols"] = [{ wch: 14 }, { wch: 60 }];
-    const ws2 = XLSX.utils.aoa_to_sheet(findings); ws2["!cols"] = [{ wch: 6 }, { wch: 6 }, { wch: 16 }, { wch: 90 }];
-    const ws3 = XLSX.utils.aoa_to_sheet(annotated, { cellDates: true });
-    const origMerges = state.wb.Sheets[state.sheet]["!merges"];
-    if (origMerges) ws3["!merges"] = origMerges;
-    XLSX.utils.book_append_sheet(wb, ws1, "요약");
-    XLSX.utils.book_append_sheet(wb, ws2, "지적사항");
-    XLSX.utils.book_append_sheet(wb, ws3, "원본+검토결과");
-    const base = state.fileName.replace(/\.[^.]+$/, "");
-    const buf = XLSX.write(wb, { bookType: "xlsx", type: "array" });
-    const url = URL.createObjectURL(new Blob([buf], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" }));
-    const a = document.createElement("a");
-    a.href = url; a.download = `${base}_재검토결과.xlsx`;
-    document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
-  });
+    // 헤더
+    const hr = res.headerRow;
+    const head = own(ws.getCell(hr, outCol));
+    head.value = "검토결과 (자동)";
+    head.font = { bold: true, color: { argb: "FFFFFFFF" } };
+    head.fill = solid("FFC00000");
+    head.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
+    head.border = { top: thin, left: thin, bottom: thin, right: thin };
+    if (res.dataStartRow > hr + 1) {
+      try { ws.mergeCells(hr, outCol, res.dataStartRow - 1, outCol); } catch {}
+    }
+
+    // 항목별 결과
+    for (const it of res.items) {
+      const fs = byRow.get(it.rowNum) || [];
+      const cell = own(ws.getCell(it.rowNum, outCol));
+      cell.border = { top: thin, left: thin, bottom: thin, right: thin };
+      cell.alignment = { vertical: "top", wrapText: true };
+      if (!fs.length) {
+        cell.value = "이상 없음";
+        cell.font = { color: { argb: "FF006100" } };
+        continue;
+      }
+      const worst = fs.reduce((a, f) => (RANK[f.level] > RANK[a] ? f.level : a), "info");
+      cell.value = fs.map((f) => `[${LEVEL_KO[f.level]}] ${f.msg}`).join("\n");
+      cell.font = { color: { argb: FONT[worst] } };
+      cell.fill = solid(FILL[worst]);
+
+      // 문제 칸에 색칠 + 메모
+      const byField = new Map();
+      for (const f of fs) {
+        if (!f.field || !res.columns[f.field]) continue;
+        if (!byField.has(f.field)) byField.set(f.field, []);
+        byField.get(f.field).push(f);
+      }
+      for (const [field, list] of byField) {
+        const target = own(ws.getCell(it.rowNum, res.columns[field].col + 1));
+        const lv = list.reduce((a, f) => (RANK[f.level] > RANK[a] ? f.level : a), "info");
+        target.fill = solid(FILL[lv]);
+        const msg = "[검토] " + list.map((f) => `${LEVEL_KO[f.level]}: ${f.msg}`).join("\n");
+        const prev = target.note ? (typeof target.note === "string" ? target.note : (target.note.texts || []).map((t) => t.text).join("")) : "";
+        target.note = prev ? `${prev}\n\n${msg}` : msg;
+      }
+    }
+  }
+
+  function addSummarySheets(wb, res, preserved) {
+    const s = wb.addWorksheet("검토요약");
+    s.getColumn(1).width = 16; s.getColumn(2).width = 90;
+    const put = (r, a, b, opt = {}) => {
+      s.getCell(r, 1).value = a; s.getCell(r, 2).value = b;
+      s.getCell(r, 1).font = { bold: true };
+      s.getCell(r, 2).alignment = { wrapText: true, vertical: "top" };
+      if (opt.fill) s.getCell(r, 2).fill = solid(opt.fill);
+    };
+    s.getCell(1, 1).value = "위험성평가 재검토 결과";
+    s.getCell(1, 1).font = { bold: true, size: 16 };
+    let r = 3;
+    put(r++, "파일", state.fileName);
+    put(r++, "검토 시트", `${state.sheet} (이 시트의 오른쪽 끝에 ‘검토결과’ 열이 추가됨)`);
+    put(r++, "검토일", new Date().toISOString().slice(0, 10));
+    put(r++, "점수 / 판정", `${res.score}점 / ${res.verdict}`);
+    put(r++, "지적 건수", `오류 ${res.counts.error} · 경고 ${res.counts.warn} · 참고 ${res.counts.info}`);
+    put(r++, "평가 기준", `가능성 1~${res.settings.fScale} ${res.settings.method === "mul" ? "×" : "+"} 중대성 1~${res.settings.sScale}, 허용 가능 위험성 ≤ ${res.settings.acceptable}`);
+    put(r++, "색 표시", "빨강 = 오류", { fill: FILL.error });
+    put(r++, "", "노랑 = 경고", { fill: FILL.warn });
+    put(r++, "", "파랑 = 참고  (색칠된 칸에 마우스를 올리면 메모로 이유가 보입니다)", { fill: FILL.info });
+    if (!preserved) put(r++, "안내", "원본 형식(.xls/.csv 등)을 직접 수정할 수 없어 값만 옮긴 새 파일로 만들었습니다.");
+    r++;
+    const general = res.findings.filter((f) => !f.row);
+    if (general.length) {
+      s.getCell(r++, 1).value = "문서 전체 지적사항";
+      s.getCell(r - 1, 1).font = { bold: true, size: 13 };
+      for (const f of general) put(r++, LEVEL_KO[f.level], f.msg, { fill: FILL[f.level] });
+      r++;
+    }
+    s.getCell(r++, 1).value = "※ 자동 검토 결과는 참고용이며, 최종 판단은 평가 실시 주체와 안전보건 전문가가 해야 합니다.";
+
+    const d = wb.addWorksheet("지적사항목록");
+    d.columns = [{ header: "수준", width: 8 }, { header: "행", width: 7 }, { header: "항목", width: 16 }, { header: "내용", width: 100 }];
+    d.getRow(1).font = { bold: true };
+    for (const f of res.findings) {
+      const row = d.addRow([LEVEL_KO[f.level], f.row || "전체", f.field ? (res.columns[f.field] ? res.columns[f.field].label : f.field) : "", f.msg]);
+      row.getCell(1).fill = solid(FILL[f.level]);
+      row.getCell(4).alignment = { wrapText: true };
+    }
+    d.views = [{ state: "frozen", ySplit: 1 }];
+
+    // 요약 시트를 맨 앞으로, 검토 시트를 활성화
+    const order = [s, ...wb.worksheets.filter((w) => w !== s)];
+    order.forEach((w, i) => { w.orderNo = i; });
+    wb.views = [{ activeTab: 0, firstSheet: 0 }];
+  }
 
   // ---------- AI 검토 ----------
   fetch("/api/review").then((r) => r.ok ? r.json() : null).then((j) => {

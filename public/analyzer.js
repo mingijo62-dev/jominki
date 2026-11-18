@@ -328,7 +328,10 @@
 
       const expected = calc(i.freq, i.sev);
       if (has("risk")) {
-        if (i.risk == null && i.riskGrade == null) iss("error", "RISK_EMPTY", "위험성(위험도) 결과가 비어 있습니다.", "risk");
+        if (i.risk == null && i.riskGrade == null) {
+          if (expected != null) iss("warn", "RISK_EMPTY", `위험성(위험도) 결과가 비어 있습니다. (가능성×중대성 = ${expected}) 수식이라면 엑셀에서 한 번 저장한 뒤 다시 올려주세요.`, "risk");
+          else iss("error", "RISK_EMPTY", "위험성(위험도) 결과가 비어 있습니다.", "risk");
+        }
         else if (expected != null && i.risk != null && Math.abs(expected - i.risk) > 1e-9)
           iss("error", "RISK_CALC", `위험성 계산 오류: 가능성 ${i.freq} ${method === "add" ? "+" : "×"} 중대성 ${i.sev} = ${expected}인데 ${i.risk}(으)로 기재되어 있습니다.`, "risk");
       }
@@ -422,6 +425,7 @@
       return {
         ok: true,
         headerRow: hr + 1,
+        dataStartRow: dataStart + 1,
         columns: Object.fromEntries(Object.entries(cols).map(([k, c]) => [k, { col: c, label: labels[c] ? labels[c].full : "" }])),
         settings: { method, fScale, sScale, maxRisk, acceptable, defaultAcceptable },
         meta,
