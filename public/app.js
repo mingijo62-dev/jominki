@@ -128,7 +128,6 @@
     const fields = copyFieldsFor(res);
     $("itemCount").textContent = `평가 항목 ${res.items.length}개를 찾았습니다`;
     $("colsBrief").textContent = `헤더 ${res.headerRow}행 · 데이터 ${res.items[0].rowNum}~${res.items[res.items.length - 1].rowNum}행`;
-    $("copiedCols").textContent = fields.map((f) => f.title).join(", ");
     const head = `<thead><tr><th>행</th>${fields.map((f) => `<th>${esc(f.title)}</th>`).join("")}</tr></thead>`;
     const body = res.items.map((it) => `<tr><td class="num">${it.rowNum}</td>${fields.map((f) =>
       `<td class="${["freq", "sev", "risk"].includes(f.key) ? "num" : f.key === "hazard" || f.key === "current" ? "wide" : ""}">${esc(it[f.prop])}</td>`).join("")}</tr>`).join("");
@@ -149,16 +148,12 @@
     btn.disabled = true; btn.textContent = "만드는 중…";
     try {
       const { wb, preserved } = await openWorkbook();
-      const name = uniqueName(wb, "보완목록");
-      const ws = wb.addWorksheet(name, { views: [{ state: "frozen", ySplit: 6, xSplit: 0 }] });
-      buildList(ws, res);
-      // 보완목록을 평가표 시트 바로 뒤에 두고, 열었을 때 보완목록이 보이게
-      const target = wb.getWorksheet(state.sheet);
-      const others = wb.worksheets.filter((w) => w !== ws);
-      const idx = target ? others.indexOf(target) + 1 : others.length;
-      const order = [...others.slice(0, idx), ws, ...others.slice(idx)];
-      order.forEach((w, i) => { w.orderNo = i; if (w.views && w.views[0]) w.views[0].tabSelected = w === ws; });
-      wb.views = [{ activeTab: order.indexOf(ws), firstSheet: 0, visibility: "visible" }];
+      const ws = wb.getWorksheet(state.sheet.slice(0, 31));
+      if (!ws) throw new Error("평가표 시트를 찾지 못했습니다.");
+      addInputArea(ws, res);
+      // 파일을 열면 평가표 시트가 보이게
+      wb.worksheets.forEach((w) => { if (w.views && w.views[0]) w.views[0].tabSelected = w === ws; });
+      wb.views = [{ activeTab: wb.worksheets.indexOf(ws), firstSheet: 0, visibility: "visible" }];
       const buf = await wb.xlsx.writeBuffer();
       const base = state.fileName.replace(/\.[^.]+$/, "");
       download(buf, `${base}_보완목록.xlsx`);
@@ -171,10 +166,135 @@
     }
   });
 
-  function uniqueName(wb, base) {
-    let n = base, i = 2;
-    while (wb.getWorksheet(n)) n = `${base}(${i++})`;
-    return n;
+  // 원본 평가표 시트의 표 오른쪽(마지막 사용 열 다음)에 보완 작성란을 붙인다
+  const INPUT_COLS = [
+    { key: "judge", title: "유효성 검토\n(판정)", width: 11, kind: "input" },
+    { key: "issue", title: "보완 필요 사항\n(검토 의견)", width: 30, kind: "input" },
+    { key: "measure", title: "보완 대책", width: 30, kind: "input" },
+    { key: "af", title: "보완후\n빈도", width: 6, kind: "input" },
+    { key: "as", title: "보완후\n강도", width: 6, kind: "input" },
+    { key: "ar", title: "보완후\n위험도", width: 7, kind: "auto" },
+    { key: "owner", title: "담당자", width: 9, kind: "input" },
+    { key: "due", title: "완료\n예정일", width: 11, kind: "input" },
+    { key: "done", title: "완료\n확인", width: 7, kind: "input" },
+    { key: "memo", title: "비고", width: 14, kind: "input" },
+  ];
+
+  function addInputArea(ws, res) {
+    const s = res.settings;
+    const items = res.items;
+    const hr = res.headerRow;
+    const r1 = items[0].rowNum, r2 = items[items.length - 1].rowNum;
+
+    // 시작 열: 헤더~마지막 항목 행에서 값이 있는 가장 오른쪽 열의 다음 열
+    const { rows } = sheetRows(state.sheet);
+    let lastCol = 0;
+    for (let r = Math.max(0, hr - 2); r < Math.min(rows.length, r2); r++) {
+      const row = rows[r] || [];
+      for (let c = row.length - 1; c >= 0; c--) {
+        if (row[c] !== "" && row[c] != null) { if (c + 1 > lastCol) lastCol = c + 1; break; }
+      }
+    }
+    const c0 = lastCol + 1;
+    const ci = Object.fromEntries(INPUT_COLS.map((c, i) => [c.key, c0 + i]));
+    const cEnd = c0 + INPUT_COLS.length - 1;
+    INPUT_COLS.forEach((c, i) => { ws.getColumn(c0 + i).width = c.width; });
+
+    // 원본 글자 크기에 맞춤
+    const hz = res.columns.hazard ? ws.getCell(r1, res.columns.hazard.col + 1) : null;
+    const size = (hz && hz.font && hz.font.size) || 9;
+    const fontName = hz && hz.font && hz.font.name;
+    const font = (extra = {}) => ({ size, ...(fontName ? { name: fontName } : {}), ...extra });
+
+    // 머리글: 원본이 2단 헤더면 위 칸에 묶음 제목, 아래 칸에 항목명
+    const headRows = Math.max(1, res.dataStartRow - hr);
+    const styleHead = (cell, argb) => {
+      cell.style = {};
+      cell.font = font({ bold: true, color: { argb: "FFFFFFFF" } });
+      cell.fill = solid(argb);
+      cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
+      cell.border = border;
+    };
+    let subRow = hr;
+    if (headRows >= 2) {
+      const g = ws.getCell(hr, c0);
+      try { ws.mergeCells(hr, c0, hr, cEnd); } catch {}
+      g.value = "보완목록 (유효성 검토 · 직접 작성)";
+      styleHead(g, "FFC65911");
+      subRow = hr + 1;
+    }
+    INPUT_COLS.forEach((col, i) => {
+      const cell = ws.getCell(subRow, c0 + i);
+      cell.value = col.title;
+      styleHead(cell, col.kind === "auto" ? C.autoHead : "FFE26B0A");
+      if (res.dataStartRow - 1 > subRow) { try { ws.mergeCells(subRow, c0 + i, res.dataStartRow - 1, c0 + i); } catch {} }
+    });
+
+    // 진행 현황: 머리글 바로 위 칸 (작성하면 자동 갱신)
+    if (hr > 1) {
+      const rng = (k) => `${colLetter(ci[k])}${r1}:${colLetter(ci[k])}${r2}`;
+      const total = items.length;
+      const stat = [
+        ["전체", String(total)],
+        ["검토", `COUNTA(${rng("judge")})`],
+        ["보완필요", `COUNTIF(${rng("judge")},"보완필요")`],
+        ["보완완료", `COUNTIF(${rng("judge")},"보완완료")`],
+        ["미검토", `${total}-COUNTA(${rng("judge")})`],
+      ];
+      const pr = hr - 1;
+      let free = true;
+      for (let c = c0; c <= cEnd; c++) { const v = ws.getCell(pr, c).value; if (v !== null && v !== undefined && v !== "") free = false; }
+      if (free) {
+        try { ws.mergeCells(pr, c0, pr, cEnd); } catch {}
+        const p = ws.getCell(pr, c0);
+        p.value = { formula: '"진행 현황 ▶ " & ' + stat.map(([k, f]) => `"${k} "&${f}`).join(' & "  ·  " & ') };
+        p.style = {};
+        p.font = font({ bold: true, color: { argb: "FF7F3F00" } });
+        p.fill = solid("FFFFF2CC");
+        p.alignment = { horizontal: "center", vertical: "middle", shrinkToFit: true };
+        p.border = border;
+      }
+    }
+
+    // 각 평가 항목 행에 작성 칸 (원본 행 높이는 그대로 둠)
+    const plus = s.method === "add" ? "+" : "*";
+    const itemRows = new Set(items.map((it) => it.rowNum));
+    for (let r = r1; r <= r2; r++) {
+      if (!itemRows.has(r)) continue;
+      INPUT_COLS.forEach((col, i) => {
+        const cell = ws.getCell(r, c0 + i);
+        cell.style = {};
+        cell.border = border;
+        cell.font = font();
+        const left = col.key === "issue" || col.key === "measure" || col.key === "memo";
+        cell.alignment = { vertical: "middle", horizontal: left ? "left" : "center", wrapText: true };
+        if (col.kind === "input") cell.fill = solid(C.input);
+      });
+      const fL = colLetter(ci.af), sL = colLetter(ci.as);
+      ws.getCell(r, ci.ar).value = { formula: `IF(AND(ISNUMBER(${fL}${r}),ISNUMBER(${sL}${r})),${fL}${r}${plus}${sL}${r},"")` };
+      ws.getCell(r, ci.judge).dataValidation = { type: "list", allowBlank: true, formulae: ['"적정,보완필요,해당없음,보완완료"'], showErrorMessage: true, errorTitle: "유효성 검토", error: "목록에서 선택하세요." };
+      ws.getCell(r, ci.af).dataValidation = { type: "whole", operator: "between", allowBlank: true, formulae: [1, s.fScale], showErrorMessage: true, error: `1~${s.fScale} 사이 숫자를 입력하세요.` };
+      ws.getCell(r, ci.as).dataValidation = { type: "whole", operator: "between", allowBlank: true, formulae: [1, s.sScale], showErrorMessage: true, error: `1~${s.sScale} 사이 숫자를 입력하세요.` };
+      ws.getCell(r, ci.due).numFmt = "yyyy-mm-dd";
+      ws.getCell(r, ci.done).dataValidation = { type: "list", allowBlank: true, formulae: ['"완료,진행중,미착수"'] };
+    }
+
+    // 판정에 따라 색이 바뀌는 조건부 서식
+    const L = colLetter(ci.judge);
+    let pri = 1;
+    const rule = (text, argb, fontArgb) => ({ type: "expression", formulae: ["$" + L + r1 + '="' + text + '"'], priority: pri++,
+      style: { fill: { type: "pattern", pattern: "solid", fgColor: { argb }, bgColor: { argb } }, font: { color: { argb: fontArgb }, bold: true } } });
+    ws.addConditionalFormatting({ ref: `${L}${r1}:${L}${r2}`, rules: [
+      rule("보완필요", "FFFFC7CE", "FF9C0006"), rule("보완완료", "FFDDEBF7", "FF1F4E79"),
+      rule("적정", "FFC6EFCE", "FF006100"), rule("해당없음", "FFEDEDED", "FF595959"),
+    ] });
+
+    // 인쇄 영역이 지정돼 있으면 작성란까지 넓힘
+    const pa = ws.pageSetup && ws.pageSetup.printArea;
+    if (pa && /:\$?[A-Z]+\$?\d+$/.test(pa)) {
+      ws.pageSetup.printArea = pa.replace(/:(\$?)([A-Z]+)(\$?\d+)$/, (m, d, col, rest) => `:${d}${colLetter(cEnd)}${rest}`);
+    }
+    state.inputArea = { from: colLetter(c0), to: colLetter(cEnd) };
   }
 
   function download(buf, filename) {
@@ -204,154 +324,5 @@
       for (const m of src["!merges"] || []) { try { ws.mergeCells(m.s.r + 1, m.s.c + 1, m.e.r + 1, m.e.c + 1); } catch {} }
     }
     return { wb, preserved: false };
-  }
-
-  function buildList(ws, res) {
-    const fields = copyFieldsFor(res);
-    const s = res.settings;
-    const cols = [
-      { key: "no", title: "No", width: 5, kind: "copy" },
-      { key: "row", title: "원본\n행", width: 6, kind: "copy" },
-      ...fields.map((f) => ({ ...f, kind: "copy" })),
-      { key: "judge", title: "유효성 검토\n(판정)", width: 11, kind: "input" },
-      { key: "issue", title: "보완 필요 사항\n(검토 의견)", width: 34, kind: "input" },
-      { key: "measure", title: "보완 대책", width: 34, kind: "input" },
-      { key: "af", title: "보완후\n빈도", width: 7, kind: "input" },
-      { key: "as", title: "보완후\n강도", width: 7, kind: "input" },
-      { key: "ar", title: "보완후\n위험도", width: 7, kind: "auto" },
-      { key: "owner", title: "담당자", width: 10, kind: "input" },
-      { key: "due", title: "완료\n예정일", width: 11, kind: "input" },
-      { key: "done", title: "완료\n확인", width: 8, kind: "input" },
-      { key: "memo", title: "비고", width: 16, kind: "input" },
-    ];
-    const ci = Object.fromEntries(cols.map((c, i) => [c.key, i + 1]));
-    const last = cols.length;
-    cols.forEach((c, i) => { ws.getColumn(i + 1).width = c.width; });
-
-    // 1행: 제목, 2~3행: 정보·결재, 4행: 진행 현황, 5~6행: 머리글
-    ws.mergeCells(1, 1, 1, last);
-    const t = ws.getCell(1, 1);
-    t.value = "위험성평가 보완목록 (유효성 검토)";
-    t.font = { bold: true, size: 16 };
-    t.alignment = { horizontal: "center", vertical: "middle" };
-    ws.getRow(1).height = 30;
-
-    const info = [
-      ["대상 파일", state.fileName], ["평가표 시트", state.sheet],
-      ["평가일자", res.meta.evalDate || ""], ["항목 수", res.items.length],
-    ];
-    ws.getCell(2, 1).value = info.map(([k, v]) => `${k}: ${v}`).join("    ");
-    ws.mergeCells(2, 1, 2, Math.max(3, ci.judge - 1));
-    ws.getCell(2, 1).font = { size: 10, color: { argb: "FF404040" } };
-    ws.getCell(3, 1).value = "※ 노란 칸에 직접 작성합니다. ‘유효성 검토’는 목록에서 선택(적정/보완필요/해당없음/보완완료), 보완후 위험도와 진행 현황은 자동 계산됩니다.";
-    ws.mergeCells(3, 1, 3, Math.max(3, ci.judge - 1));
-    ws.getCell(3, 1).font = { size: 9, color: { argb: "FF7F7F7F" } };
-
-    // 결재란 (오른쪽 위)
-    const signs = ["작성", "검토", "승인"];
-    const signStart = last - signs.length + 1;
-    signs.forEach((sg, i) => {
-      const h = ws.getCell(2, signStart + i), b = ws.getCell(3, signStart + i);
-      h.value = sg; h.alignment = { horizontal: "center", vertical: "middle" }; h.fill = solid("FFE7E6E6"); h.font = { bold: true, size: 9 };
-      h.border = border; b.border = border;
-    });
-    ws.getRow(3).height = 34;
-
-    const r1 = 7, r2 = 6 + res.items.length;
-    const rng = (k) => `${colLetter(ci[k])}${r1}:${colLetter(ci[k])}${r2}`;
-    const stat = [
-      ["전체", `COUNTA(${rng("row")})`],
-      ["검토완료", `COUNTA(${rng("judge")})`],
-      ["보완필요", `COUNTIF(${rng("judge")},"보완필요")`],
-      ["보완완료", `COUNTIF(${rng("judge")},"보완완료")`],
-      ["미검토", `COUNTA(${rng("row")})-COUNTA(${rng("judge")})`],
-    ];
-    // 진행 현황: 한 칸에 모아서 표시 (작성하면 자동 갱신)
-    ws.mergeCells(4, ci.judge, 4, last);
-    const prog = ws.getCell(4, ci.judge);
-    prog.value = { formula: '"진행 현황  ▶  " & ' + stat.map(([k, f]) => `"${k} "&${f}`).join(' & "   ·   " & ') };
-    prog.font = { bold: true, size: 10, color: { argb: "FF7F3F00" } };
-    prog.fill = solid("FFFFF2CC");
-    prog.alignment = { horizontal: "center", vertical: "middle" };
-    prog.border = border;
-    ws.getRow(4).height = 20;
-
-    // 머리글 (5행: 묶음, 6행: 항목)
-    const groups = [
-      { from: 1, to: ci.judge - 1, title: "원본 평가 내용", argb: C.copyHead },
-      { from: ci.judge, to: last, title: "유효성 검토 및 보완 (직접 작성)", argb: C.inputHead },
-    ];
-    for (const g of groups) {
-      ws.mergeCells(5, g.from, 5, g.to);
-      const cell = ws.getCell(5, g.from);
-      cell.value = g.title;
-      cell.fill = solid(g.argb);
-      cell.font = { bold: true, color: { argb: "FFFFFFFF" } };
-      cell.alignment = { horizontal: "center", vertical: "middle" };
-      cell.border = border;
-    }
-    cols.forEach((col, i) => {
-      const cell = ws.getCell(6, i + 1);
-      cell.value = col.title;
-      cell.fill = solid(col.kind === "copy" ? C.copyHead : col.kind === "auto" ? C.autoHead : C.inputHead);
-      cell.font = { bold: true, size: 10, color: { argb: "FFFFFFFF" } };
-      cell.alignment = { horizontal: "center", vertical: "middle", wrapText: true };
-      cell.border = border;
-    });
-    ws.getRow(5).height = 20;
-    ws.getRow(6).height = 32;
-
-    // 항목
-    const plus = s.method === "add" ? "+" : "*";
-    res.items.forEach((it, idx) => {
-      const r = r1 + idx;
-      const row = ws.getRow(r);
-      cols.forEach((col, i) => {
-        const cell = row.getCell(i + 1);
-        cell.border = border;
-        cell.font = { size: 10 };
-        const left = ["hazard", "current", "issue", "measure", "memo", "process"].includes(col.key);
-        cell.alignment = { vertical: "middle", horizontal: left ? "left" : "center", wrapText: true };
-        if (col.kind === "input") cell.fill = solid(C.input);
-        else if (col.kind === "copy") cell.fill = solid(C.copy);
-      });
-      row.getCell(ci.no).value = idx + 1;
-      row.getCell(ci.row).value = it.rowNum;
-      for (const f of fields) {
-        const v = it[f.prop];
-        row.getCell(ci[f.key]).value = v === "" || v == null ? null : v;
-      }
-      const fL = colLetter(ci.af), sL = colLetter(ci.as);
-      row.getCell(ci.ar).value = { formula: `IF(AND(ISNUMBER(${fL}${r}),ISNUMBER(${sL}${r})),${fL}${r}${plus}${sL}${r},"")` };
-      row.getCell(ci.judge).dataValidation = { type: "list", allowBlank: true, formulae: ['"적정,보완필요,해당없음,보완완료"'], showErrorMessage: true, errorTitle: "유효성 검토", error: "목록에서 선택하세요." };
-      row.getCell(ci.af).dataValidation = { type: "whole", operator: "between", allowBlank: true, formulae: [1, s.fScale], showErrorMessage: true, error: `1~${s.fScale} 사이 숫자를 입력하세요.` };
-      row.getCell(ci.as).dataValidation = { type: "whole", operator: "between", allowBlank: true, formulae: [1, s.sScale], showErrorMessage: true, error: `1~${s.sScale} 사이 숫자를 입력하세요.` };
-      row.getCell(ci.due).numFmt = "yyyy-mm-dd";
-      row.getCell(ci.done).dataValidation = { type: "list", allowBlank: true, formulae: ['"완료,진행중,미착수"'] };
-      // 줄바꿈되는 글자 수를 대략 계산해 행 높이 지정
-      const lines = (v, w) => String(v || "").split("\n").reduce((n, part) => n + Math.max(1, Math.ceil(part.length / w)), 0);
-      const widthOf = (k) => (cols[ci[k] - 1] ? cols[ci[k] - 1].width * 0.55 : 20);
-      const n = Math.max(
-        ci.hazard ? lines(it.hazard, widthOf("hazard")) : 1,
-        ci.current ? lines(it.current, widthOf("current")) : 1,
-        ci.process ? lines(it.process, widthOf("process")) : 1,
-      );
-      row.height = Math.max(20, n * 14 + 4);
-    });
-
-    // 판정에 따라 색이 바뀌는 조건부 서식
-    const L = colLetter(ci.judge);
-    let pri = 1;
-    const rule = (text, argb, fontArgb) => ({ type: "expression", formulae: ["$" + L + r1 + '="' + text + '"'], priority: pri++,
-      style: { fill: { type: "pattern", pattern: "solid", fgColor: { argb }, bgColor: { argb } }, font: { color: { argb: fontArgb }, bold: true } } });
-    ws.addConditionalFormatting({ ref: `${L}${r1}:${L}${r2}`, rules: [
-      rule("보완필요", "FFFFC7CE", "FF9C0006"), rule("보완완료", "FFDDEBF7", "FF1F4E79"),
-      rule("적정", "FFC6EFCE", "FF006100"), rule("해당없음", "FFEDEDED", "FF595959"),
-    ] });
-
-    // 인쇄 설정: A3 가로, 너비 한 페이지, 머리글 반복
-    ws.pageSetup = { paperSize: 8, orientation: "landscape", fitToPage: true, fitToWidth: 1, fitToHeight: 0,
-      margins: { left: 0.3, right: 0.3, top: 0.4, bottom: 0.4, header: 0.2, footer: 0.2 }, printTitlesRow: "5:6" };
-    ws.autoFilter = { from: { row: 6, column: 1 }, to: { row: r2, column: last } };
   }
 })();

@@ -37,5 +37,13 @@ const ExcelJS = require("exceljs");
     if (r < r1 + 2) { cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFD9D9D9" } }; cell.font = { bold: true, size: 9 }; }
   }
   [12, 6, 48, 9, 24, 5, 5, 6, 24, 7, 5, 5, 6].forEach((w, i) => (ws.getColumn(i + 1).width = w));
+  // 실제 양식처럼: 개선후 위험도 옆 메모 열(연도), 위험도 빨간 글씨 조건부 서식, 로고 그림, 인쇄 영역
+  ws.getCell(`N${r1 + 2}`).value = "23년"; ws.getCell(`N${r1 + 4}`).value = "21년"; ws.getCell(`N${r1 + 11}`).value = 22;
+  ws.getColumn(14).width = 4;
+  ws.addConditionalFormatting({ ref: `H${r1 + 2}:H${r1 + 11}`, rules: [{ type: "cellIs", operator: "greaterThan", formulae: [2], priority: 1, style: { font: { color: { argb: "FFFF0000" } } } }] });
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAEAAAAAQCAIAAAD4YuoOAAAAGklEQVR4nGNgGAWjYBSMglEwCkbBKBgFgwYAAOAAAZ0ZNkkAAAAASUVORK5CYII=", "base64");
+  const img = wb.addImage({ buffer: png, extension: "png" });
+  ws.addImage(img, { tl: { col: 2.2, row: 0.2 }, ext: { width: 90, height: 24 } });
+  ws.pageSetup.printArea = `A1:M${r1 + 11}`;
   await wb.xlsx.writeFile(process.argv[2]);
 })();
